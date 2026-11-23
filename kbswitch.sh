@@ -33,6 +33,7 @@ POLL_SECS="${POLL_SECS:-2}"
 IDLE_THRESHOLD_SECS="${IDLE_THRESHOLD_SECS:-2}"
 COOLDOWN_SECS="${COOLDOWN_SECS:-20}"
 PAIR_RETRY_SECS="${PAIR_RETRY_SECS:-30}"
+RELEASE_GRACE_SECS="${RELEASE_GRACE_SECS:-15}"
 
 export PATH="$HOME/.local/bin:$HOME/homebrew/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 ME="$(hostname -s)"
@@ -55,11 +56,21 @@ screen_locked() {
 
 notify() { osascript -e "display notification \"$1\" with title \"kbswitch\"" >/dev/null 2>&1; }
 
+MARK="$HOME/.cache/kbswitch.released"
+mkdir -p "$(dirname "$MARK")"
+
 release_local() {
+  touch "$MARK"
   blueutil --disconnect "$KB_ADDR" >/dev/null 2>&1
   blueutil --unpair "$KB_ADDR" >/dev/null 2>&1
   log "teclado liberado neste Mac ($1)"
 }
+
+released_at() { [[ -f "$MARK" ]] && stat -f %m "$MARK" || echo 0; }
+
+# Depois de soltar o teclado, não tenta puxar de volta por RELEASE_GRACE_SECS
+# (evita pingue-pongue com o input que você acabou de fazer aqui).
+recently_released() { (( $(date +%s) - $(released_at) < RELEASE_GRACE_SECS )); }
 
 ntfy_send() {
   [[ -n "$NTFY_TOPIC" ]] || return 1
@@ -72,7 +83,9 @@ ntfy_listen() {
     curl -sN --max-time 3600 "$NTFY_SERVER/$NTFY_TOPIC/raw" 2>/dev/null |
       while IFS= read -r line; do
         [[ "$line" == release\ * && "$line" != "release $ME" ]] || continue
-        is_connected && release_local "pedido de ${line#release }"
+        # Solta sempre, mesmo que is_connected diga que não: se a leitura de
+        # estado falhar, o teclado ficaria preso aqui para sempre.
+        release_local "pedido de ${line#release }"
       done
     sleep 5
   done
@@ -80,6 +93,7 @@ ntfy_listen() {
 
 grab() {
   if is_connected; then log "teclado já está conectado aqui"; return 0; fi
+  local started; started="$(date +%s)"
 
   log "tentando conexão direta…"
   if blueutil --connect "$KB_ADDR" >/dev/null 2>&1 && sleep 1 && is_connected; then
@@ -92,6 +106,9 @@ grab() {
   blueutil --unpair "$KB_ADDR" >/dev/null 2>&1
   local deadline=$(( SECONDS + PAIR_RETRY_SECS )) warned=0
   while (( SECONDS < deadline )); do
+    if (( $(released_at) >= started )); then
+      log "o outro Mac pediu o teclado durante a tentativa — desistindo"; return 1
+    fi
     blueutil --pair "$KB_ADDR" >/dev/null 2>&1
     blueutil --connect "$KB_ADDR" >/dev/null 2>&1
     sleep 1
@@ -127,7 +144,7 @@ daemon() {
     elif ! screen_locked || (( !RELEASE_ON_LOCK )); then
       # Exige atividade em 2 verificações seguidas para evitar toques acidentais.
       if (( idle < IDLE_THRESHOLD_SECS )); then hits=$(( hits + 1 )); else hits=0; fi
-      if (( hits >= 2 && SECONDS - last_attempt > COOLDOWN_SECS )); then
+      if (( hits >= 2 && SECONDS - last_attempt > COOLDOWN_SECS )) && ! recently_released; then
         log "atividade detectada neste Mac sem teclado — puxando"
         last_attempt=$SECONDS
         grab
